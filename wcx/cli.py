@@ -41,6 +41,24 @@ console = Console()
 err = Console(stderr=True, style="red")
 
 
+def _version_callback(value: bool):
+    if value:
+        from . import __version__
+        console.print(f"wcx {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False, "--version", "-V", callback=_version_callback,
+        is_eager=True, help="显示版本并退出。",
+    ),
+):
+    """wcx — 微信公众号文章抓取工具。"""
+    pass
+
+
 def _get_fetcher() -> fetcher.Fetcher:
     creds = config.load_credentials()
     if not creds:
