@@ -9,8 +9,14 @@ from markdownify import markdownify
 
 
 def fetch_article_html(url: str, *, impersonate: str = "chrome120") -> str:
-    """Fetch the public article page HTML (no auth needed for public articles)."""
-    resp = cffi_requests.get(url, impersonate=impersonate, timeout=30)
+    """Fetch the public article page HTML (no auth needed for public articles).
+
+    WeChat returns a 301 on http:// that curl_cffi's default impersonated session
+    mishandles as 501. Normalize to https:// and enable redirect following.
+    """
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    resp = cffi_requests.get(url, impersonate=impersonate, timeout=30, allow_redirects=True)
     resp.raise_for_status()
     return resp.text
 
