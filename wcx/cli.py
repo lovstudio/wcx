@@ -11,6 +11,8 @@ Commands:
 """
 from __future__ import annotations
 
+import json
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -397,6 +399,206 @@ def version():
     """显示版本。"""
     from . import __version__
     console.print(f"wcx {__version__}")
+
+
+PROGRESS_PREFIX = "__WXMP_FETCH_PROGRESS__"
+
+
+@app.command(name="search-accounts-json")
+def search_accounts_json(
+    query: str = typer.Argument(..., help="公众号名称"),
+):
+    """搜索公众号，返回 JSON 数组（机器接口）。"""
+    try:
+        creds = config.load_credentials()
+        if not creds:
+            raise RuntimeError("尚未登录，请先扫码登录")
+        f = fetcher.Fetcher(creds.token, creds.cookie)
+        results = f.search_biz(query)
+        print(json.dumps([acc.to_dict() for acc in results], ensure_ascii=False))
+    except fetcher.AuthError as e:
+        raise SystemExit(f"认证失败：{e}")
+    except fetcher.RateLimitError as e:
+        raise SystemExit(f"触发风控：{e}")
+    except Exception as e:
+        raise SystemExit(str(e))
+
+
+@app.command(name="fetch-article-content-json")
+def fetch_article_content_json(
+    link: str = typer.Argument(..., help="文章 URL"),
+):
+    """抓取单篇文章正文，返回 JSON（机器接口）。"""
+    try:
+        html = article_mod.fetch_article_html(link)
+        inner, md = article_mod.extract_content(html)
+        print(json.dumps({"html": inner, "md": md}, ensure_ascii=False))
+    except Exception as e:
+        raise SystemExit(str(e))
+
+
+@app.command(name="fetch-selected-account-json")
+def fetch_selected_account_json(
+    account_json: str = typer.Argument(..., help="账号 JSON 字符串"),
+    limit: int = typer.Argument(..., help="最多抓取篇数"),
+    with_content: str = typer.Argument(..., help="是否抓取正文：0 或 1"),
+):
+    """抓取指定公众号的文章列表+正文，带进度协议（机器接口）。"""
+
+    def _text(value):
+        return value or ""
+
+    account = None  # forward-declare for emit
+
+    def emit(stage, status, message, current=None, total=None, title=None):
+        print(PROGRESS_PREFIX + json.dumps({
+            "fakeid": account.fakeid if account else "",
+            "nickname": account.nickname if account else "",
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "current": current,
+            "total": total,
+            "title": title,
+        }, ensure_ascii=False), flush=True)
+
+    try:
+        payload = json.loads(account_json)
+        fetch_limit = limit
+        do_content = with_content == "1"
+
+        creds = config.load_credentials()
+        if not creds:
+            raise RuntimeError("尚未登录，请先扫码登录")
+
+        account = fetcher.Account(
+            fakeid=_text(payload.get("fakeid")).strip(),
+            nickname=_text(payload.get("nickname")).strip(),
+            alias=_text(payload.get("alias")).strip(),
+            signature=_text(payload.get("signature")).strip(),
+            round_head_img=_text(
+                payload.get("avatar") or payload.get("round_head_img")
+            ).strip(),
+        )
+        if not account.fakeid or not account.nickname:
+            raise RuntimeError("公众号选择缺少 fakeid 或昵称")
+
+        emit("prepare", "done", f"已确认目标公众号：{account.nickname}")
+
+        f = fetcher.Fetcher(creds.token, creds.cookie)
+        count = 0
+        content_count = 0
+        article_total = fetch_limit
+
+        with cache.connect() as conn:
+            emit("account", "running", "正在写入账号信息")
+            cache.upsert_account(conn, account.to_dict())
+            emit("account", "done", "账号信息已写入本地缓存")
+
+            def on_page(begin, fetched, total):
+                nonlocal article_total
+                article_total = min(total, fetch_limit) if fetch_limit else total
+                emit(
+                    "articles",
+                    "running",
+                    f"已读取第 {begin // 5 + 1} 页文章索引，本页 {fetched} 篇",
+                    count,
+                    article_total,
+                )
+
+            emit("articles", "running", "正在请求公众号文章索引", 0, article_total)
+            for art in f.iter_all_articles(
+                account.fakeid, max_items=fetch_limit, page_size=5
+            ):
+                cache.upsert_article(conn, art.to_dict())
+                count += 1
+                emit(
+                    "articles",
+                    "running",
+                    f"已写入 {count}/{article_total} 篇文章索引",
+                    count,
+                    article_total,
+                    art.title,
+                )
+
+            emit(
+                "articles",
+                "done",
+                f"文章索引已入库 {count} 篇",
+                count,
+                article_total,
+            )
+
+            if do_content:
+                rows = cache.list_articles(conn, account.fakeid, limit=fetch_limit)
+                need = [r for r in rows if r["content_md"] is None]
+                emit(
+                    "content",
+                    "running",
+                    f"待抓取正文 {len(need)} 篇",
+                    0,
+                    len(need),
+                )
+                for row in need:
+                    try:
+                        emit(
+                            "content",
+                            "running",
+                            f"正在抓取正文 {content_count + 1}/{len(need)}",
+                            content_count,
+                            len(need),
+                            row["title"],
+                        )
+                        html = article_mod.fetch_article_html(row["link"])
+                        inner, md = article_mod.extract_content(html)
+                        cache.set_article_content(conn, row["aid"], inner, md)
+                        content_count += 1
+                        emit(
+                            "content",
+                            "running",
+                            f"正文已写入 {content_count}/{len(need)}",
+                            content_count,
+                            len(need),
+                            row["title"],
+                        )
+                    except Exception as e:
+                        emit(
+                            "content",
+                            "warning",
+                            f"正文抓取失败：{e}",
+                            content_count,
+                            len(need),
+                            row["title"],
+                        )
+                        print(f"{row['title']}: {e}", file=sys.stderr)
+                    time.sleep(1.0)
+                emit(
+                    "content",
+                    "done",
+                    f"正文抓取完成 {content_count}/{len(need)} 篇",
+                    content_count,
+                    len(need),
+                )
+
+        emit(
+            "complete",
+            "done",
+            f"已完成：文章索引 {count} 篇，正文 {content_count} 篇",
+            count,
+            count,
+        )
+        print(json.dumps({
+            "fakeid": account.fakeid,
+            "nickname": account.nickname,
+            "count": count,
+            "content_count": content_count,
+        }, ensure_ascii=False))
+    except fetcher.AuthError as e:
+        raise SystemExit(f"认证失败：{e}")
+    except fetcher.RateLimitError as e:
+        raise SystemExit(f"触发风控：{e}")
+    except Exception as e:
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":
