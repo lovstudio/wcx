@@ -251,7 +251,7 @@ def fetch(
 
         if with_content:
             rows = cache.list_articles(conn, account.fakeid, limit=limit)
-            need = [r for r in rows if r["content_md"] is None]
+            need = [r for r in rows if not (r["content_md"] or "").strip()]
             if not need:
                 console.print("[dim]所有文章已有缓存正文[/]")
                 return
@@ -268,6 +268,8 @@ def fetch(
                     try:
                         html = article_mod.fetch_article_html(r["link"])
                         inner, md = article_mod.extract_content(html)
+                        if not inner.strip() and not md.strip():
+                            raise RuntimeError("解析出的正文为空")
                         cache.set_article_content(conn, r["aid"], inner, md)
                     except Exception as e:  # noqa: BLE001
                         err.print(f"[red]✗[/] {r['title']}: {e}")
@@ -531,7 +533,7 @@ def fetch_selected_account_json(
 
             if do_content:
                 rows = cache.list_articles(conn, account.fakeid, limit=fetch_limit)
-                need = [r for r in rows if r["content_md"] is None]
+                need = [r for r in rows if not (r["content_md"] or "").strip()]
                 emit(
                     "content",
                     "running",
@@ -551,6 +553,8 @@ def fetch_selected_account_json(
                         )
                         html = article_mod.fetch_article_html(row["link"])
                         inner, md = article_mod.extract_content(html)
+                        if not inner.strip() and not md.strip():
+                            raise RuntimeError("解析出的正文为空")
                         cache.set_article_content(conn, row["aid"], inner, md)
                         content_count += 1
                         emit(
