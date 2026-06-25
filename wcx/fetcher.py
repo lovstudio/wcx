@@ -1,11 +1,15 @@
 """WeChat appmsg API client.
 
-Uses the `cgi-bin/appmsg?action=list_ex` endpoint (same as wechat-article-exporter).
+Lists articles via the `cgi-bin/appmsgpublish?sub=list` endpoint (发表记录),
+which returns the *complete* publish history — including articles that were
+发表 (published) but not 群发 (mass-sent). The older `appmsg?action=list_ex`
+endpoint only returns 群发记录 and silently omits publish-only articles.
 Requires the user to be logged into their own WeChat Official Account backend
 and provide the `token` and cookie from that session.
 """
 from __future__ import annotations
 
+import json
 import random
 import time
 from dataclasses import dataclass
@@ -16,6 +20,7 @@ from curl_cffi import requests as cffi_requests
 BASE = "https://mp.weixin.qq.com"
 SEARCH_BIZ_URL = f"{BASE}/cgi-bin/searchbiz"
 APPMSG_URL = f"{BASE}/cgi-bin/appmsg"
+APPMSGPUBLISH_URL = f"{BASE}/cgi-bin/appmsgpublish"
 
 DEFAULT_HEADERS = {
     "Referer": f"{BASE}/",
@@ -158,15 +163,20 @@ class Fetcher:
         begin: int = 0,
         count: int = 5,
     ) -> tuple[list[ArticleMeta], int]:
-        """Fetch one page. Returns (articles, total)."""
+        """Fetch one page of 发表记录. Returns (articles, total).
+
+        `begin`/`count` and the returned `total` are in *publish-record* units.
+        One record may expand into several articles (多图文 / multi-item posts),
+        so a page can yield more than `count` articles.
+        """
         data = self._get(
-            APPMSG_URL,
+            APPMSGPUBLISH_URL,
             params={
-                "action": "list_ex",
+                "sub": "list",
                 "begin": begin,
                 "count": count,
                 "fakeid": fakeid,
-                "type": 9,
+                "type": "101_1",
                 "query": "",
                 "token": self.token,
                 "lang": "zh_CN",
@@ -174,22 +184,38 @@ class Fetcher:
                 "ajax": 1,
             },
         )
-        total = int(data.get("app_msg_cnt", 0))
+        page = data.get("publish_page")
+        if isinstance(page, str):
+            page = json.loads(page) if page else {}
+        page = page or {}
+        total = int(page.get("total_count", 0))
         articles: list[ArticleMeta] = []
-        for item in data.get("app_msg_list", []):
-            articles.append(
-                ArticleMeta(
-                    aid=str(item.get("aid") or item.get("app_msg_id") or item.get("appmsgid", "")),
-                    fakeid=fakeid,
-                    title=item.get("title", ""),
-                    link=item.get("link", ""),
-                    digest=item.get("digest", ""),
-                    cover=item.get("cover", ""),
-                    author=item.get("author_name") or item.get("author", ""),
-                    create_time=int(item.get("create_time", 0)),
-                    update_time=int(item.get("update_time", 0)),
+        for entry in page.get("publish_list", []):
+            info = entry.get("publish_info")
+            if not info:
+                continue
+            if isinstance(info, str):
+                info = json.loads(info)
+            sent_time = (info.get("sent_info") or {}).get("time") or 0
+            for art in info.get("appmsg_info", []):
+                if art.get("is_deleted"):
+                    continue
+                # Publish-only (not 群发) articles have no sent_info.time;
+                # fall back to the per-article line_info.send_time.
+                ts = sent_time or (art.get("line_info") or {}).get("send_time") or 0
+                articles.append(
+                    ArticleMeta(
+                        aid=f"{art.get('appmsgid', '')}_{art.get('itemidx', 1)}",
+                        fakeid=fakeid,
+                        title=art.get("title", ""),
+                        link=art.get("content_url", ""),
+                        digest=art.get("digest", ""),
+                        cover=art.get("cover", ""),
+                        author=art.get("author_name") or art.get("author", ""),
+                        create_time=int(ts),
+                        update_time=int(ts),
+                    )
                 )
-            )
         return articles, total
 
     def iter_all_articles(
