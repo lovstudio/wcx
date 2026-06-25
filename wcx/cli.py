@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -406,6 +407,17 @@ def version():
 PROGRESS_PREFIX = "__WXMP_FETCH_PROGRESS__"
 
 
+def _parse_date_range(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    try:
+        start = datetime.strptime(value.strip(), "%Y-%m-%d")
+    except ValueError as exc:
+        raise RuntimeError(f"日期格式应为 YYYY-MM-DD：{value}") from exc
+    end = start + timedelta(days=1)
+    return int(start.timestamp()), int(end.timestamp())
+
+
 @app.command(name="search-accounts-json")
 def search_accounts_json(
     query: str = typer.Argument(..., help="公众号名称"),
@@ -442,8 +454,21 @@ def fetch_article_content_json(
 @app.command(name="fetch-selected-account-json")
 def fetch_selected_account_json(
     account_json: str = typer.Argument(..., help="账号 JSON 字符串"),
-    limit: int = typer.Argument(..., help="最多抓取篇数"),
+    limit: int = typer.Argument(
+        ...,
+        help="最多抓取篇数（forward/backward）；audit 模式下作为已知区间上限的保险值",
+    ),
     with_content: str = typer.Argument(..., help="是否抓取正文：0 或 1"),
+    mode: str = typer.Option(
+        "forward",
+        "--mode",
+        help="抓取方向：forward=从最新开始（默认），backward=从本地最老一篇之后继续向旧抓，audit=重扫已有区间并补漏",
+    ),
+    audit_date: str | None = typer.Option(
+        None,
+        "--audit-date",
+        help="audit 模式下只检测指定日期当天的文章，格式 YYYY-MM-DD",
+    ),
 ):
     """抓取指定公众号的文章列表+正文，带进度协议（机器接口）。"""
 
@@ -468,6 +493,14 @@ def fetch_selected_account_json(
         payload = json.loads(account_json)
         fetch_limit = limit
         do_content = with_content == "1"
+        mode_normalized = (mode or "forward").strip().lower()
+        if mode_normalized not in {"forward", "backward", "audit"}:
+            raise RuntimeError(f"未知抓取模式：{mode}")
+        if audit_date and mode_normalized != "audit":
+            raise RuntimeError("--audit-date 只能与 --mode audit 一起使用")
+        audit_range = (
+            _parse_date_range(audit_date) if mode_normalized == "audit" else None
+        )
 
         creds = config.load_credentials()
         if not creds:
@@ -485,54 +518,161 @@ def fetch_selected_account_json(
         if not account.fakeid or not account.nickname:
             raise RuntimeError("公众号选择缺少 fakeid 或昵称")
 
-        emit("prepare", "done", f"已确认目标公众号：{account.nickname}")
+        audit_date_label = audit_date.strip() if audit_date else ""
+        target_desc = f"，检测日期={audit_date_label}" if audit_date_label else ""
+        emit(
+            "prepare",
+            "done",
+            f"已确认目标公众号：{account.nickname}（mode={mode_normalized}{target_desc}）",
+        )
 
         f = fetcher.Fetcher(creds.token, creds.cookie)
         count = 0
         content_count = 0
-        article_total = fetch_limit
 
         with cache.connect() as conn:
             emit("account", "running", "正在写入账号信息")
             cache.upsert_account(conn, account.to_dict())
             emit("account", "done", "账号信息已写入本地缓存")
 
+            local_count = conn.execute(
+                "SELECT COUNT(*) FROM articles WHERE fakeid = ?",
+                (account.fakeid,),
+            ).fetchone()[0]
+            local_aids: set[str] = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT aid FROM articles WHERE fakeid = ?",
+                    (account.fakeid,),
+                ).fetchall()
+            }
+
+            if mode_normalized == "forward":
+                start_begin = 0
+                page_max_items = fetch_limit
+                article_total = fetch_limit
+                stage_label = "向前续抓"
+            elif mode_normalized == "backward":
+                start_begin = local_count
+                page_max_items = fetch_limit
+                article_total = fetch_limit
+                stage_label = "向后续抓"
+            else:  # audit
+                start_begin = 0
+                page_max_items = (
+                    fetch_limit if audit_range else max(local_count, fetch_limit)
+                )
+                article_total = (
+                    page_max_items if audit_range else max(local_count, fetch_limit)
+                )
+                stage_label = (
+                    f"完备性检测 {audit_date_label} 当天"
+                    if audit_range
+                    else "完备性回扫"
+                )
+
             def on_page(begin, fetched, total):
                 nonlocal article_total
-                article_total = min(total, fetch_limit) if fetch_limit else total
+                if mode_normalized == "audit":
+                    article_total = max(min(total, page_max_items), 1)
+                else:
+                    article_total = min(total, fetch_limit) if fetch_limit else total
                 emit(
                     "articles",
                     "running",
-                    f"已读取第 {begin // 5 + 1} 页文章索引，本页 {fetched} 篇",
+                    f"{stage_label}：读取 begin={begin}，本页 {fetched} 篇",
                     count,
                     article_total,
                 )
 
-            emit("articles", "running", "正在请求公众号文章索引", 0, article_total)
+            emit(
+                "articles",
+                "running",
+                f"{stage_label}：从 begin={start_begin} 开始请求文章索引",
+                0,
+                article_total,
+            )
+
+            new_inserts = 0
+            matched_count = 0
+            matched_aids: list[str] = []
             for art in f.iter_all_articles(
-                account.fakeid, max_items=fetch_limit, page_size=5
+                account.fakeid,
+                max_items=page_max_items,
+                page_size=5,
+                start_begin=start_begin,
+                on_page=on_page,
             ):
-                cache.upsert_article(conn, art.to_dict())
                 count += 1
+                if audit_range:
+                    day_start, day_end = audit_range
+                    if art.create_time >= day_end:
+                        emit(
+                            "articles",
+                            "running",
+                            f"{stage_label}：已扫描 {count}/{article_total}，等待进入当天区间",
+                            count,
+                            article_total,
+                            art.title,
+                        )
+                        continue
+                    if art.create_time < day_start:
+                        emit(
+                            "articles",
+                            "running",
+                            f"{stage_label}：已越过当天边界",
+                            count,
+                            article_total,
+                            art.title,
+                        )
+                        break
+
+                is_new = art.aid not in local_aids
+                cache.upsert_article(conn, art.to_dict())
+                matched_count += 1
+                matched_aids.append(art.aid)
+                if is_new:
+                    local_aids.add(art.aid)
+                    new_inserts += 1
                 emit(
                     "articles",
                     "running",
-                    f"已写入 {count}/{article_total} 篇文章索引",
+                    f"{stage_label}：已扫描 {count}/{article_total}，匹配 {matched_count} 篇，新增 {new_inserts} 篇",
                     count,
                     article_total,
                     art.title,
                 )
 
+            done_msg = (
+                f"{stage_label}完成：扫描 {count} 篇，"
+                f"{'新增' if mode_normalized != 'audit' else '补漏'} {new_inserts} 篇"
+            )
+            if audit_range:
+                done_msg = (
+                    f"{stage_label}完成：扫描 {count} 篇，"
+                    f"当天 {matched_count} 篇，补漏 {new_inserts} 篇"
+                )
             emit(
                 "articles",
                 "done",
-                f"文章索引已入库 {count} 篇",
+                done_msg,
                 count,
                 article_total,
             )
 
             if do_content:
-                rows = cache.list_articles(conn, account.fakeid, limit=fetch_limit)
+                if audit_range:
+                    placeholders = ",".join("?" for _ in matched_aids)
+                    rows = (
+                        conn.execute(
+                            f"SELECT * FROM articles WHERE aid IN ({placeholders}) ORDER BY create_time DESC",
+                            matched_aids,
+                        ).fetchall()
+                        if matched_aids
+                        else []
+                    )
+                else:
+                    rows = cache.list_articles(conn, account.fakeid, limit=fetch_limit)
                 need = [r for r in rows if not (r["content_md"] or "").strip()]
                 emit(
                     "content",
@@ -584,17 +724,32 @@ def fetch_selected_account_json(
                     len(need),
                 )
 
+        action_word = "补漏" if mode_normalized == "audit" else "新增"
+        complete_message = (
+            f"已完成（mode={mode_normalized}）：扫描 {count} 篇，"
+            f"{action_word} {new_inserts} 篇，正文 {content_count} 篇"
+        )
+        if audit_range:
+            complete_message = (
+                f"已完成（mode={mode_normalized}, audit_date={audit_date_label}）："
+                f"扫描 {count} 篇，当天 {matched_count} 篇，补漏 {new_inserts} 篇，正文 {content_count} 篇"
+            )
         emit(
             "complete",
             "done",
-            f"已完成：文章索引 {count} 篇，正文 {content_count} 篇",
+            complete_message,
             count,
             count,
         )
         print(json.dumps({
             "fakeid": account.fakeid,
             "nickname": account.nickname,
-            "count": count,
+            "mode": mode_normalized,
+            "audit_date": audit_date_label or None,
+            "scanned": count,
+            "matched_count": matched_count,
+            "new_inserts": new_inserts,
+            "count": count,  # kept for backwards compat
             "content_count": content_count,
         }, ensure_ascii=False))
     except fetcher.AuthError as e:

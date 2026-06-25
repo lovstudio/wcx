@@ -200,13 +200,16 @@ class Fetcher:
         page_size: int = 5,
         min_delay: float = 5.0,
         max_delay: float = 15.0,
+        start_begin: int = 0,
         on_page: Callable[[int, int, int], None] | None = None,
     ) -> Iterator[ArticleMeta]:
-        """Paginate through all articles with polite delay.
+        """Paginate through articles with polite delay.
 
+        start_begin: server-side offset to start from (0 = newest).
+        max_items: stop after this many yielded items (None = until total).
         on_page(begin, fetched_this_page, total) called after each page.
         """
-        begin = 0
+        begin = start_begin
         yielded = 0
         seen_aids: set[str] = set()
         while True:
